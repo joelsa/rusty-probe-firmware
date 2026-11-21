@@ -1,0 +1,26 @@
+xtask/src/main.rs
+  s_601751f99d514f::t_f45b9a884cdc0d 166
+  s_601751f99d514f::t_d029b152222cc8 31
+  s_601751f99d514f::t_9b4438419eeca6 22
+  s_601751f99d514f::t_4b88cc67df6f45 78-79
+.cargo/config.toml
+  s_601751f99d514f::t_246bd977ab9e26 3,8
+README.md
+  s_601751f99d514f::t_0492eff22f2490 7-8,12-13,19,28,33-34,41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "28ed2a1dc9a2afba8481a8e9381538d1cb762f65",
+  "prompts": {},
+  "sessions": {
+    "s_601751f99d514f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fd1328e5-0a95-41ad-a68a-ec3fc71a482f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Joël Schulz-Andres <joel@systemscape.de>"
+    }
+  }
+}
