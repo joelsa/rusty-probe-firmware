@@ -1,0 +1,19 @@
+src/systick_delay.rs
+  s_601751f99d514f::t_f2dc15e8208ea5 27-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b5583f8a0630bd2258a1d284fa2c22c9d166dd5d",
+  "prompts": {},
+  "sessions": {
+    "s_601751f99d514f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fd1328e5-0a95-41ad-a68a-ec3fc71a482f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Joël Schulz-Andres <joel@systemscape.de>"
+    }
+  }
+}
