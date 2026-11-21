@@ -1,0 +1,19 @@
+src/dap.rs
+  s_601751f99d514f::t_a28b5f1a4260a6 374-375
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "57138d4b7c0862e47f3effa35eb2827e7fbecaec",
+  "prompts": {},
+  "sessions": {
+    "s_601751f99d514f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fd1328e5-0a95-41ad-a68a-ec3fc71a482f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Joël Schulz-Andres <joel@systemscape.de>"
+    }
+  }
+}
