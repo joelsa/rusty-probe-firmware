@@ -1,0 +1,19 @@
+README.md
+  s_601751f99d514f::t_28086c7b4c31d6 20-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c644c6e4698defeac1147680555233fcf413b32e",
+  "prompts": {},
+  "sessions": {
+    "s_601751f99d514f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fd1328e5-0a95-41ad-a68a-ec3fc71a482f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Joël Schulz-Andres <joel@systemscape.de>"
+    }
+  }
+}
