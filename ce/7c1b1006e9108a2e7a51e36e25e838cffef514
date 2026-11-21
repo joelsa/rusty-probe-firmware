@@ -1,0 +1,20 @@
+src/usb.rs
+  s_601751f99d514f::t_393f82b927b355 93
+  s_601751f99d514f::t_c9dfd9a95902bf 31-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ce7c1b1006e9108a2e7a51e36e25e838cffef514",
+  "prompts": {},
+  "sessions": {
+    "s_601751f99d514f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fd1328e5-0a95-41ad-a68a-ec3fc71a482f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Joël Schulz-Andres <joel@systemscape.de>"
+    }
+  }
+}
