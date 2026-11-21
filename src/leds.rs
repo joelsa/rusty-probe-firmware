@@ -4,12 +4,10 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::Poll;
 
 use dap_rs::dap::DapLeds;
-use embedded_hal::digital::OutputPin;
-use rtic_common::waker_registration::CriticalSectionWakerRegistration;
-use rtic_monotonics::fugit::ExtU64;
-use rtic_monotonics::Monotonic;
-
-use crate::setup::{LedBluePin, LedGreenPin, LedRedPin, Mono};
+use embassy_futures::select::select;
+use embassy_rp::gpio::{Level, Output};
+use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::Timer;
 
 #[derive(Debug, Clone, Copy, PartialEq, defmt::Format)]
 enum HostStatus {
@@ -51,14 +49,14 @@ impl From<NonZeroU8> for HostStatus {
 }
 
 pub struct BoardLeds {
-    red: LedRedPin,
-    green: LedGreenPin,
-    blue: LedBluePin,
+    red: Output<'static>,
+    green: Output<'static>,
+    blue: Output<'static>,
     rgb: (bool, bool, bool),
 }
 
 impl BoardLeds {
-    pub fn new(red: LedRedPin, green: LedGreenPin, blue: LedBluePin) -> Self {
+    pub fn new(red: Output<'static>, green: Output<'static>, blue: Output<'static>) -> Self {
         let mut me = Self {
             red,
             green,
@@ -70,15 +68,15 @@ impl BoardLeds {
     }
 
     fn set_red(&mut self, level: bool) {
-        self.red.set_state((!level).into()).ok();
+        self.red.set_level(Level::from(!level));
     }
 
     fn set_green(&mut self, level: bool) {
-        self.green.set_state((!level).into()).ok();
+        self.green.set_level(Level::from(!level));
     }
 
     fn set_blue(&mut self, level: bool) {
-        self.blue.set_state((!level).into()).ok();
+        self.blue.set_level(Level::from(!level));
     }
 
     pub fn state(&self) -> (bool, bool, bool) {
@@ -164,8 +162,8 @@ impl LedManager {
         &VTARGET_STORAGE
     }
 
-    fn waker() -> &'static CriticalSectionWakerRegistration {
-        static REG: CriticalSectionWakerRegistration = CriticalSectionWakerRegistration::new();
+    fn waker() -> &'static AtomicWaker {
+        static REG: AtomicWaker = AtomicWaker::new();
         &REG
     }
 
@@ -265,8 +263,6 @@ impl LedManager {
     async fn update(&mut self) {
         let is_activity = self.set();
         if is_activity {
-            use futures_util::{future::select, pin_mut};
-
             // Wait for a little bit so the status can actually be seen, unless
             // it changes to another non-idle state.
 
@@ -280,12 +276,8 @@ impl LedManager {
                     }
                 }
             };
-            pin_mut!(wait_for_nonactive_status);
 
-            let timeout = Mono::delay(100.millis());
-            pin_mut!(timeout);
-
-            select(wait_for_nonactive_status, timeout).await;
+            select(wait_for_nonactive_status, Timer::after_millis(100)).await;
         } else {
             let _ = self.wait_for_change().await;
         }

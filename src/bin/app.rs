@@ -1,149 +1,111 @@
 #![no_std]
 #![no_main]
 
-use rusty_probe as _;
+use defmt::unwrap;
+use embassy_executor::Spawner;
+use embassy_rp::executor::Executor;
+use embassy_rp::multicore::{spawn_core1, Stack};
+use embassy_time::Timer;
+use rusty_probe::{
+    dap,
+    leds::{LedManager, Vtarget},
+    setup::*,
+    usb::{self, ProbeUsb},
+    vcom,
+};
+use static_cell::StaticCell;
 
-#[rtic::app(device = rp2040_hal::pac, dispatchers = [XIP_IRQ, CLOCKS_IRQ])]
-mod app {
-    use core::mem::MaybeUninit;
-    use dap_rs::usb_device::class_prelude::*;
-    use rusty_probe::{
-        leds::{LedManager, Vtarget},
-        setup::*,
-    };
-    use rp2040_hal::usb::UsbBus;
-    use rtic_monotonics::rp2040::prelude::*;
+static CORE1_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+static CORE1_EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
-    #[shared]
-    struct Shared {
-        probe_usb: rusty_probe::usb::ProbeUsb,
-    }
+// The `unwrap!`s below can only fail on a second call or spawn, which never happens.
+#[embassy_executor::main(
+    executor = "embassy_rp::executor::Executor",
+    entry = "cortex_m_rt::entry"
+)]
+async fn main(spawner: Spawner) {
+    #[cfg(feature = "defmt-bbq")]
+    let defmt_consumer = unwrap!(defmt_brtt::init!().ok());
 
-    #[local]
-    struct Local {
-        dap_handler: DapHandler,
-        target_vcc: TargetVccReader,
-        translator_power: TranslatorPower,
-        target_power: TargetPower,
-        target_physically_connected: TargetPhysicallyConnected,
-    }
+    let probe = setup(
+        embassy_rp::init(Default::default()),
+        unwrap!(cortex_m::Peripherals::take()),
+    );
+    let probe_usb = ProbeUsb::new(probe.usb, probe.serial_number);
 
-    #[init(local = [
-        usb_bus: MaybeUninit<UsbBusAllocator<UsbBus>> = MaybeUninit::uninit(),
-        delay: MaybeUninit<rusty_probe::systick_delay::Delay> = MaybeUninit::uninit(),
-    ])]
-    fn init(cx: init::Context) -> (Shared, Local) {
-        let (
-            leds,
-            probe_usb,
-            dap_handler,
-            target_vcc,
-            translator_power,
-            target_power,
-            target_physically_connected,
-        ) = setup(cx.device, cx.core, cx.local.usb_bus, cx.local.delay);
+    // Bit-banging SWD on its own core keeps USB and the virtual COM port responsive.
+    let dap_resources = probe.dap;
+    spawn_core1(probe.core1, CORE1_STACK.init(Stack::new()), move || {
+        let executor = CORE1_EXECUTOR.init(Executor::new());
+        executor.run(|spawner| spawner.spawn(unwrap!(dap::engine(dap_resources))))
+    });
 
-        voltage_translator_control::spawn().ok();
+    spawner.spawn(unwrap!(usb::run(probe_usb.device)));
+    spawner.spawn(unwrap!(usb::dap_bridge(probe_usb.dap_v1, probe_usb.dap_v2)));
+    spawner.spawn(unwrap!(vcom::run(probe_usb.vcom, probe.vcom)));
+    spawner.spawn(unwrap!(led_driver(probe.leds)));
+    spawner.spawn(unwrap!(voltage_translator_control(
+        probe.target_vcc,
+        probe.translator_power,
+        probe.target_power,
+        probe.target_physically_connected,
+    )));
+
+    #[cfg(any(feature = "defmt-bbq", feature = "usb-serial-reboot"))]
+    {
+        let (_log_sender, _reboot_receiver) = probe_usb.debug.split();
 
         #[cfg(feature = "defmt-bbq")]
-        log_pump::spawn().ok();
+        spawner.spawn(unwrap!(usb::log_pump(_log_sender, defmt_consumer)));
 
-        led_driver::spawn(leds).ok();
-
-        (
-            Shared { probe_usb },
-            Local {
-                dap_handler,
-                target_vcc,
-                translator_power,
-                target_power,
-                target_physically_connected,
-            },
-        )
+        #[cfg(feature = "usb-serial-reboot")]
+        spawner.spawn(unwrap!(usb::reboot_listener(_reboot_receiver)));
     }
+}
 
-    #[task]
-    async fn led_driver(_: led_driver::Context, mut leds: LedManager) {
-        leds.run().await;
-    }
+#[embassy_executor::task]
+async fn led_driver(mut leds: LedManager) {
+    leds.run().await;
+}
 
-    #[task(priority = 3, local = [target_vcc, translator_power, target_power, target_physically_connected])]
-    async fn voltage_translator_control(cx: voltage_translator_control::Context) {
-        loop {
-            // Set the voltage translators to track Target's VCC
-            let target_vcc_mv = cx.local.target_vcc.read_voltage_mv();
+#[embassy_executor::task]
+async fn voltage_translator_control(
+    mut target_vcc: TargetVccReader,
+    mut translator_power: TranslatorPower,
+    // Owned by the task to keep the target power pins configured.
+    _target_power: TargetPower,
+    mut target_physically_connected: TargetPhysicallyConnected,
+) {
+    loop {
+        // Set the voltage translators to track Target's VCC
+        let target_vcc_mv = target_vcc.read_voltage_mv();
 
-            if target_vcc_mv > 1500 {
-                cx.local.translator_power.set_translator_vcc(target_vcc_mv);
+        if target_vcc_mv > 1500 {
+            translator_power.set_translator_vcc(target_vcc_mv);
+        } else {
+            if target_physically_connected.target_detected() {
+                // If there is no VCC detected use 3.3v.
+                translator_power.set_translator_vcc(3300);
             } else {
-                if cx.local.target_physically_connected.target_detected() {
-                    // If there is no VCC detected use 3.3v.
-                    cx.local.translator_power.set_translator_vcc(3300);
-                } else {
-                    cx.local.translator_power.set_translator_vcc(0);
-                }
+                translator_power.set_translator_vcc(0);
             }
+        }
 
-            defmt::trace!("Tracking Target VCC at {} mV", target_vcc_mv);
+        defmt::trace!("Tracking Target VCC at {} mV", target_vcc_mv);
 
-            if target_vcc_mv > 2500 {
+        if target_vcc_mv > 2500 {
+            LedManager::set_current_vtarget(Some(Vtarget::Voltage3V3));
+        } else if target_vcc_mv > 1500 {
+            LedManager::set_current_vtarget(Some(Vtarget::Voltage1V8));
+        } else {
+            if target_physically_connected.target_detected() {
+                // If there is no VCC detected use 3.3v.
                 LedManager::set_current_vtarget(Some(Vtarget::Voltage3V3));
-            } else if target_vcc_mv > 1500 {
-                LedManager::set_current_vtarget(Some(Vtarget::Voltage1V8));
             } else {
-                if cx.local.target_physically_connected.target_detected() {
-                    // If there is no VCC detected use 3.3v.
-                    LedManager::set_current_vtarget(Some(Vtarget::Voltage3V3));
-                } else {
-                    LedManager::set_current_vtarget(None);
-                }
-            };
-
-            Mono::delay(100.millis()).await;
-        }
-    }
-
-    #[task(shared = [probe_usb])]
-    async fn log_pump(mut ctx: log_pump::Context) {
-        loop {
-            ctx.shared
-                .probe_usb
-                .lock(|probe_usb| probe_usb.flush_logs());
-            Mono::delay(100.millis()).await;
-        }
-    }
-
-    #[task(binds = USBCTRL_IRQ, priority = 2, shared = [ probe_usb ], local = [dap_handler, resp_buf: [u8; 64] = [0; 64]])]
-    fn on_usb(ctx: on_usb::Context) {
-        let mut probe_usb = ctx.shared.probe_usb;
-        let dap = ctx.local.dap_handler;
-        let resp_buf = ctx.local.resp_buf;
-
-        probe_usb.lock(|probe_usb| {
-            if let Some(request) = probe_usb.interrupt() {
-                use dap_rs::{dap::DapVersion, usb::Request};
-
-                match request {
-                    Request::DAP1Command((report, n)) => {
-                        let len = dap.process_command(&report[..n], resp_buf, DapVersion::V1);
-
-                        if len > 0 {
-                            probe_usb.dap1_reply(&resp_buf[..len]);
-                        }
-                    }
-                    Request::DAP2Command((report, n)) => {
-                        let len = dap.process_command(&report[..n], resp_buf, DapVersion::V2);
-
-                        if len > 0 {
-                            probe_usb.dap2_reply(&resp_buf[..len]);
-                        }
-                    }
-                    Request::Suspend => {
-                        defmt::info!("Got USB suspend command");
-                        dap.suspend();
-                    }
-                }
+                LedManager::set_current_vtarget(None);
             }
-        });
+        };
+
+        Timer::after_millis(100).await;
     }
 }

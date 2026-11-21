@@ -1,107 +1,65 @@
 use crate::dap::{Context, Jtag, Swd, Swo, Wait};
 use crate::leds::{BoardLeds, HostStatusToken, LedManager};
-use crate::systick_delay::Delay;
-use crate::{dap, usb::ProbeUsb};
-use core::mem::MaybeUninit;
-use dap_rs::usb_device::class_prelude::UsbBusAllocator;
-use embedded_hal::digital::{InputPin, OutputPin, StatefulOutputPin};
-use embedded_hal::pwm::SetDutyCycle;
-use embedded_hal_02::adc::OneShot;
-use replace_with::replace_with_or_abort_unchecked;
-use rp2040_hal::adc::AdcPin;
-use rp2040_hal::gpio::bank0::{
-    Gpio0, Gpio10, Gpio11, Gpio12, Gpio16, Gpio17, Gpio19, Gpio20, Gpio21, Gpio26, Gpio27, Gpio28,
-    Gpio29, Gpio3, Gpio5, Gpio6, Gpio7, Gpio8, Gpio9,
+use cortex_m::peripheral::SYST;
+use embassy_rp::adc::{self, Adc, Channel};
+use embassy_rp::gpio::{Drive, Flex, Input, Level, Output, Pull, SlewRate};
+use embassy_rp::peripherals::{
+    CORE1, PIN_0, PIN_20, PIN_21, PIN_5, PWM_SLICE0, PWM_SLICE2, UART1, USB,
 };
-use rp2040_hal::gpio::{
-    FunctionSio, FunctionSioInput, FunctionSioOutput, PinId, PinState, PullDown, PullNone,
-    PullType, PullUp, SioInput, SioOutput, ValidFunction,
-};
-use rp2040_hal::{
-    clocks::init_clocks_and_plls,
-    gpio::{OutputDriveStrength, OutputSlewRate, Pin, Pins},
-    pac,
-    pwm::{self, FreeRunning, Pwm0, Pwm2, Slice},
-    rom_data,
-    usb::UsbBus,
-    watchdog::Watchdog,
-    Adc, Clock, Sio,
-};
-use rtic_monotonics::rp2040::prelude::*;
+use embassy_rp::pwm::{self, Pwm};
+use embassy_rp::{bind_interrupts, rom_data, uart, usb, Peri, Peripherals};
 
-const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
+bind_interrupts!(pub struct Irqs {
+    USBCTRL_IRQ => usb::InterruptHandler<USB>;
+    UART1_IRQ => uart::BufferedInterruptHandler<UART1>;
+});
 
 pub type DapHandler = dap_rs::dap::Dap<'static, Context, HostStatusToken, Wait, Jtag, Swd, Swo>;
-rp2040_timer_monotonic!(Mono);
 
-pub type VTargetPwmPin = Pin<Gpio0, FunctionSioOutput, PullDown>;
-pub type Enable5VKeyPin = Pin<Gpio3, FunctionSioOutput, PullDown>;
-pub type VTranslatorPwmPin = Pin<Gpio5, FunctionSio<SioOutput>, PullDown>;
-pub type EnableVTargetPin = Pin<Gpio6, FunctionSioOutput, PullDown>;
-pub type Enable5VPin = Pin<Gpio7, FunctionSioOutput, PullDown>;
-pub type GndDetectPin = Pin<Gpio8, FunctionSioInput, PullUp>;
-pub type ResetPin = DynPin<Gpio9, PullNone>;
-pub type SwdioPin = DynPin<Gpio10, PullDown>;
-pub type SwclkPin = DynPin<Gpio11, PullDown>;
-pub type DirSwdioPin = Pin<Gpio12, FunctionSioOutput, PullNone>;
-pub type TdoSwoPin = DynPin<Gpio16, PullDown>;
-pub type TdiPin = DynPin<Gpio17, PullDown>;
-pub type DirSwclkPin = Pin<Gpio19, FunctionSioOutput, PullNone>;
-pub type VcpTxPin = DynPin<Gpio20, PullUp>;
-pub type VcpRxPin = DynPin<Gpio21, PullUp>;
-pub type VTargetAdcPin = AdcPin<Pin<Gpio26, FunctionSio<SioInput>, PullNone>>;
-pub type LedGreenPin = Pin<Gpio27, FunctionSio<SioOutput>, PullDown>;
-pub type LedRedPin = Pin<Gpio28, FunctionSio<SioOutput>, PullDown>;
-pub type LedBluePin = Pin<Gpio29, FunctionSio<SioOutput>, PullDown>;
+pub type ResetPin = Flex<'static>;
+pub type SwdioPin = Flex<'static>;
+pub type SwclkPin = Flex<'static>;
+pub type DirSwdioPin = Output<'static>;
+pub type DirSwclkPin = Output<'static>;
+pub type VcomUart = UART1;
+pub type VcomTxPin = PIN_20;
+pub type VcomRxPin = PIN_21;
 
-/// The linker will place this boot block at the start of our program image. We
-/// need this to help the ROM bootloader get our code up and running.
-#[link_section = ".boot2"]
-#[used]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+/// Everything core 1 needs to process DAP commands.
+pub struct DapResources {
+    pub swdio: SwdioPin,
+    pub swclk: SwclkPin,
+    pub nreset: ResetPin,
+    pub dir_swdio: DirSwdioPin,
+    pub dir_swclk: DirSwclkPin,
+    pub systick: SYST,
+    pub host_status: HostStatusToken,
+}
+
+/// The UART bridged to the virtual COM port, and the direction pins of its voltage translators.
+pub struct VcomResources {
+    pub uart: Peri<'static, VcomUart>,
+    pub tx: Peri<'static, VcomTxPin>,
+    pub rx: Peri<'static, VcomRxPin>,
+    pub dir_tx: Output<'static>,
+    pub dir_rx: Output<'static>,
+}
+
+pub struct Probe {
+    pub core1: Peri<'static, CORE1>,
+    pub usb: Peri<'static, USB>,
+    pub serial_number: &'static str,
+    pub dap: DapResources,
+    pub vcom: VcomResources,
+    pub leds: LedManager,
+    pub target_vcc: TargetVccReader,
+    pub translator_power: TranslatorPower,
+    pub target_power: TargetPower,
+    pub target_physically_connected: TargetPhysicallyConnected,
+}
 
 #[inline(always)]
-pub fn setup(
-    pac: pac::Peripherals,
-    core: cortex_m::Peripherals,
-    usb_bus: &'static mut MaybeUninit<UsbBusAllocator<UsbBus>>,
-    delay: &'static mut MaybeUninit<Delay>,
-) -> (
-    LedManager,
-    ProbeUsb,
-    DapHandler,
-    TargetVccReader,
-    TranslatorPower,
-    TargetPower,
-    TargetPhysicallyConnected,
-) {
-    let mut resets = pac.RESETS;
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let clocks = if let Ok(clocks) = init_clocks_and_plls(
-        XOSC_CRYSTAL_FREQ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut resets,
-        &mut watchdog,
-    ) {
-        clocks
-    } else {
-        unreachable!()
-    };
-
-    let usb_bus: &'static _ = usb_bus.write(UsbBusAllocator::new(UsbBus::new(
-        pac.USBCTRL_REGS,
-        pac.USBCTRL_DPRAM,
-        clocks.usb_clock,
-        true,
-        &mut resets,
-    )));
-
-    #[cfg(feature = "defmt-bbq")]
-    let consumer = defmt_brtt::init().ok().unwrap();
-
+pub fn setup(p: Peripherals, core: cortex_m::Peripherals) -> Probe {
     let rom_version = rom_data::rom_version_number();
     let git_revision = rom_data::git_revision();
     let copyright = rom_data::copyright_string();
@@ -113,45 +71,27 @@ pub fn setup(
         copyright
     );
 
-    let probe_usb = ProbeUsb::new(
-        &usb_bus,
-        #[cfg(feature = "defmt-bbq")]
-        consumer,
-    );
+    let serial_number = crate::device_signature::device_id_hex(p.FLASH);
+    defmt::info!("Device ID: {}", serial_number);
 
-    let sio = Sio::new(pac.SIO);
-    let pins = Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut resets);
-
-    let mut led_green = pins.gpio27.into_push_pull_output();
-    led_green.set_high().ok();
-    let mut led_red = pins.gpio28.into_push_pull_output();
-    led_red.set_high().ok();
-    let mut led_blue = pins.gpio29.into_push_pull_output();
-    led_blue.set_high().ok();
-
-    // Enable ADC
-    let adc = Adc::new(pac.ADC, &mut resets);
-
-    // Enable the temperature sense channel
-    // let mut temperature_sensor = adc.enable_temp_sensor();
+    let mut led_green = Output::new(p.PIN_27, Level::High);
+    led_green.set_drive_strength(Drive::_4mA);
+    let mut led_red = Output::new(p.PIN_28, Level::High);
+    led_red.set_drive_strength(Drive::_4mA);
+    let mut led_blue = Output::new(p.PIN_29, Level::High);
+    led_blue.set_drive_strength(Drive::_4mA);
 
     // Configure GPIO26 as an ADC input
-    let adc_pin_0 = AdcPin::new(pins.gpio26.into_floating_input()).expect("Not an ADC pin");
-
-    let adc = TargetVccReader {
-        pin: adc_pin_0,
-        adc,
+    let target_vcc = TargetVccReader {
+        adc: Adc::new_blocking(p.ADC, adc::Config::default()),
+        pin: Channel::new_pin(p.PIN_26, Pull::None),
     };
-
-    let pwm_slices = pwm::Slices::new(pac.PWM, &mut resets);
 
     ///////////////////////////////////
     // Voltage translator power
     ///////////////////////////////////
 
-    let pwm = pwm_slices.pwm2;
-
-    let mut translator_power = TranslatorPower::new(pins.gpio5.into_push_pull_output(), pwm);
+    let mut translator_power = TranslatorPower::new(p.PWM_SLICE2, p.PIN_5);
 
     translator_power.set_translator_vcc(1800);
 
@@ -159,15 +99,12 @@ pub fn setup(
     // Target power
     ///////////////////////////////////
 
-    // Configure PWM
-    let pwm = pwm_slices.pwm0;
-
     let mut target_power = TargetPower::new(
-        pins.gpio3.into_push_pull_output(),
-        pins.gpio7.into_push_pull_output(),
-        pins.gpio6.into_push_pull_output(),
-        pins.gpio0.into_push_pull_output(),
-        pwm,
+        Output::new(p.PIN_3, Level::Low),
+        Output::new(p.PIN_7, Level::Low),
+        Output::new(p.PIN_6, Level::Low),
+        p.PWM_SLICE0,
+        p.PIN_0,
     );
 
     // target_power.enable_vtgt();
@@ -175,203 +112,125 @@ pub fn setup(
 
     cortex_m::asm::delay(1_000_000);
 
-    let mut io = pins.gpio10;
-    let mut ck = pins.gpio11;
-    let mut dir_io = pins.gpio12;
-    let mut dir_ck = pins.gpio19;
-    let reset = pins.gpio9;
-    let gnd_detect = pins.gpio8.into_pull_up_input();
+    let mut io = Flex::new(p.PIN_10);
+    let mut ck = Flex::new(p.PIN_11);
+    let mut dir_io = Output::new(p.PIN_12, Level::Low);
+    let mut dir_ck = Output::new(p.PIN_19, Level::Low);
+    let mut reset = Flex::new(p.PIN_9);
+    let mut gnd_detect = Input::new(p.PIN_8, Pull::Up);
 
-    let _tdi = pins.gpio17;
-    let _dir_tdi = pins.gpio23;
+    // Restore the pad reset defaults the drivers clear: Schmitt trigger on, 4 mA drive.
+    io.set_schmitt(true);
+    ck.set_schmitt(true);
+    reset.set_schmitt(true);
+    reset.set_drive_strength(Drive::_4mA);
+    gnd_detect.set_schmitt(true);
 
-    let _vcp_rx = pins.gpio21;
-    let _vcp_tx = pins.gpio20;
-    let _dir_vcp_rx = pins.gpio25;
-    let _dir_vcp_tx = pins.gpio24;
+    io.set_pull(Pull::Down);
+    ck.set_pull(Pull::Down);
+    reset.set_pull(Pull::None);
 
     // High speed IO
-    io.set_drive_strength(OutputDriveStrength::TwelveMilliAmps);
-    io.set_slew_rate(OutputSlewRate::Fast);
-    ck.set_drive_strength(OutputDriveStrength::TwelveMilliAmps);
-    ck.set_slew_rate(OutputSlewRate::Fast);
-    dir_io.set_drive_strength(OutputDriveStrength::TwelveMilliAmps);
-    dir_io.set_slew_rate(OutputSlewRate::Fast);
-    dir_ck.set_drive_strength(OutputDriveStrength::TwelveMilliAmps);
-    dir_ck.set_slew_rate(OutputSlewRate::Fast);
+    io.set_drive_strength(Drive::_12mA);
+    io.set_slew_rate(SlewRate::Fast);
+    ck.set_drive_strength(Drive::_12mA);
+    ck.set_slew_rate(SlewRate::Fast);
+    dir_io.set_drive_strength(Drive::_12mA);
+    dir_io.set_slew_rate(SlewRate::Fast);
+    dir_ck.set_drive_strength(Drive::_12mA);
+    dir_ck.set_slew_rate(SlewRate::Fast);
 
-    let git_version: &'static str = git_version::git_version!();
-    let delay = delay.write(Delay::new(core.SYST, clocks.system_clock.freq().raw()));
+    // The RX translator always listens to the target. The TX translator starts listening too and
+    // only drives the target once the UART owns the TX pin.
+    let vcom = VcomResources {
+        uart: p.UART1,
+        tx: p.PIN_20,
+        rx: p.PIN_21,
+        dir_tx: Output::new(p.PIN_24, Level::Low),
+        dir_rx: Output::new(p.PIN_25, Level::Low),
+    };
 
     let board_leds = BoardLeds::new(led_red, led_green, led_blue);
     let mut led_manager = LedManager::new(board_leds);
-    let host_status_token = led_manager.host_status_token();
-    let target_physically_connected = TargetPhysicallyConnected { pin: gnd_detect };
+    let host_status = led_manager.host_status_token();
 
-    let dap_hander = dap::create_dap(
-        git_version,
-        DynPin::Input(io.into_pull_down_input()),
-        DynPin::Input(ck.into_pull_down_input()),
-        DynPin::Input(reset.into_floating_input()),
-        dir_io.into_push_pull_output().into_pull_type(),
-        dir_ck.into_push_pull_output().into_pull_type(),
-        clocks.system_clock.freq().raw(),
-        delay,
-        host_status_token,
-    );
-
-    Mono::start(pac.TIMER, &mut resets);
-
-    (
-        led_manager,
-        probe_usb,
-        dap_hander,
-        adc,
+    Probe {
+        core1: p.CORE1,
+        usb: p.USB,
+        serial_number,
+        dap: DapResources {
+            swdio: io,
+            swclk: ck,
+            nreset: reset,
+            dir_swdio: dir_io,
+            dir_swclk: dir_ck,
+            systick: core.SYST,
+            host_status,
+        },
+        vcom,
+        leds: led_manager,
+        target_vcc,
         translator_power,
         target_power,
-        target_physically_connected,
-    )
-}
-
-/// A simple Dynamic pin, meaning it can be output or input.
-pub enum DynPin<P, InputPull>
-where
-    P: PinId,
-    InputPull: PullType,
-{
-    /// The pin is in input mode.
-    Input(Pin<P, FunctionSioInput, InputPull>),
-    /// The pin is in output mode.
-    Output(Pin<P, FunctionSioOutput, InputPull>),
-}
-
-#[inline(always)]
-pub fn replace_with<T, F: FnOnce(T) -> T>(dest: &mut T, f: F) {
-    // SAFETY: We have panic = "abort".
-    unsafe { replace_with_or_abort_unchecked(dest, f) }
-}
-
-impl<P, InputPull> DynPin<P, InputPull>
-where
-    P: ValidFunction<FunctionSioInput>,
-    P: ValidFunction<FunctionSioOutput>,
-    InputPull: PullType,
-{
-    pub fn into_input(&mut self) {
-        replace_with(self, |p| match p {
-            DynPin::Input(_) => p,
-            DynPin::Output(o) => DynPin::Input(o.into_function().into_pull_type()),
-        })
+        target_physically_connected: TargetPhysicallyConnected { pin: gnd_detect },
     }
-
-    pub fn into_output(&mut self) {
-        replace_with(self, |p| match p {
-            DynPin::Input(i) => DynPin::Output(i.into_push_pull_output()),
-            DynPin::Output(_) => p,
-        })
-    }
-
-    pub fn into_output_in_state(&mut self, state: PinState) {
-        replace_with(self, |p| {
-            match p {
-                DynPin::Input(i) => {
-                    //
-                    DynPin::Output(i.into_push_pull_output_in_state(state))
-                }
-                DynPin::Output(_) => p,
-            }
-        })
-    }
-
-    /// Note: This function panics if the pin is in the wrong mode.
-    pub fn set_high(&mut self) {
-        match self {
-            DynPin::Input(_) => defmt::panic!("Output operation on input pin"),
-            DynPin::Output(o) => {
-                o.set_high().ok();
-            }
-        }
-    }
-
-    /// Note: This function panics if the pin is in the wrong mode.
-    pub fn set_low(&mut self) {
-        match self {
-            DynPin::Input(_) => defmt::panic!("Output operation on input pin"),
-            DynPin::Output(o) => {
-                o.set_low().ok();
-            }
-        }
-    }
-
-    /// Note: If the pin is an output this will only reflect the set state, NOT electrical state.
-    pub fn is_high(&mut self) -> bool {
-        match self {
-            DynPin::Input(i) => i.is_high() == Ok(true),
-            DynPin::Output(o) => o.is_set_high() == Ok(true),
-        }
-    }
-}
-
-pub struct AllIOs {
-    pub io: SwdioPin,
-    pub ck: SwclkPin,
-    pub tdi: TdiPin,
-    pub tdo_swo: TdoSwoPin,
-    pub reset: ResetPin,
-    pub vcp_rx: VcpRxPin,
-    pub vcp_tx: VcpTxPin,
 }
 
 pub struct TargetPhysicallyConnected {
-    pin: GndDetectPin,
+    pin: Input<'static>,
 }
 
 impl TargetPhysicallyConnected {
     /// This checks for the target being connected via the GND detect pin.
     pub fn target_detected(&mut self) -> bool {
         #[cfg(feature = "gnddetect")]
-        return matches!(self.pin.is_low(), Ok(true));
+        return self.pin.is_low();
         #[cfg(not(feature = "gnddetect"))]
         return true;
     }
 }
 
 pub struct TargetVccReader {
-    pub pin: VTargetAdcPin,
-    pub adc: Adc,
+    pub pin: Channel<'static>,
+    pub adc: Adc<'static, adc::Blocking>,
 }
 
 impl TargetVccReader {
     pub fn read_voltage_mv(&mut self) -> u32 {
         let Self { pin, adc } = self;
-        let val: u16 = adc.read(pin).unwrap();
+        let val = match adc.blocking_read(pin) {
+            Ok(val) => val,
+            Err(e) => {
+                defmt::warn!("Reading the target VCC failed: {}", e);
+                0
+            }
+        };
 
         (2 * 3300 * val as u32) / 4095
     }
 }
 
 pub struct TranslatorPower {
-    vtranslator_pwm: Slice<Pwm2, FreeRunning>,
+    vtranslator_pwm: Pwm<'static>,
+    config: pwm::Config,
 }
 
 impl TranslatorPower {
-    pub fn new(
-        mut vtranslator_pin: VTranslatorPwmPin,
-        mut vtranslator_pwm: Slice<Pwm2, FreeRunning>,
-    ) -> Self {
-        vtranslator_pwm.clr_ph_correct();
-        vtranslator_pwm.set_top(4095);
-        vtranslator_pwm.enable();
-
-        vtranslator_pin.set_drive_strength(OutputDriveStrength::TwelveMilliAmps);
-        vtranslator_pin.set_slew_rate(OutputSlewRate::Fast);
+    pub fn new(slice: Peri<'static, PWM_SLICE2>, vtranslator_pin: Peri<'static, PIN_5>) -> Self {
+        let pin_number = 5;
 
         // Output channel B on PWM2 to GPIO 5
-        let channel = &mut vtranslator_pwm.channel_b;
-        channel.output_to(vtranslator_pin);
-        channel.set_duty_cycle(1023).unwrap();
+        let mut config = pwm::Config::default();
+        config.top = 4095;
+        config.compare_b = 1023;
+        let vtranslator_pwm = Pwm::new_output_b(slice, vtranslator_pin, config.clone());
 
-        Self { vtranslator_pwm }
+        set_high_speed_pad(pin_number);
+
+        Self {
+            vtranslator_pwm,
+            config,
+        }
     }
 
     pub fn set_translator_vcc(&mut self, mv: u32) {
@@ -391,55 +250,58 @@ impl TranslatorPower {
 
         let cnt = ((vomax - vomin - mv_diff) * limit_diff) / (vomax - vomin) + v33;
 
-        let channel = &mut self.vtranslator_pwm.channel_b;
-        channel.set_duty_cycle(cnt as u16).unwrap();
+        self.config.compare_b = cnt as u16;
+        self.vtranslator_pwm.set_config(&self.config);
     }
 }
 
 pub struct TargetPower {
-    enable_5v_key: Enable5VKeyPin,
-    enable_vtgt: EnableVTargetPin,
-    vtgt_pwm: Slice<Pwm0, FreeRunning>,
+    enable_5v_key: Output<'static>,
+    // Kept to hold the pin high, dropping it would reset the pin.
+    _enable_5v: Output<'static>,
+    enable_vtgt: Output<'static>,
+    vtgt_pwm: Pwm<'static>,
+    config: pwm::Config,
 }
 
 impl TargetPower {
     pub fn enable_vtgt(&mut self) {
-        self.enable_vtgt.set_high().ok();
+        self.enable_vtgt.set_high();
     }
 
     pub fn enable_5v_key(&mut self) {
-        self.enable_5v_key.set_high().ok();
+        self.enable_5v_key.set_high();
     }
 
     pub fn new(
-        mut enable_5v_key: Enable5VKeyPin,
-        mut enable_5v: Enable5VPin,
-        mut enable_vtgt: EnableVTargetPin,
-        mut vtgt_pin: VTargetPwmPin,
-        mut vtgt_pwm: Slice<Pwm0, FreeRunning>,
+        mut enable_5v_key: Output<'static>,
+        mut enable_5v: Output<'static>,
+        mut enable_vtgt: Output<'static>,
+        slice: Peri<'static, PWM_SLICE0>,
+        vtgt_pin: Peri<'static, PIN_0>,
     ) -> Self {
+        let pin_number = 0;
+
         // Always enable the protected 5v (existed until rev E of hardware)
-        enable_5v.set_high().ok();
+        enable_5v.set_high();
 
-        enable_5v_key.set_low().ok();
-        enable_vtgt.set_low().ok();
-
-        vtgt_pwm.clr_ph_correct();
-        vtgt_pwm.set_top(4095);
-        vtgt_pwm.enable();
-
-        vtgt_pin.set_drive_strength(OutputDriveStrength::TwelveMilliAmps);
-        vtgt_pin.set_slew_rate(OutputSlewRate::Fast);
+        enable_5v_key.set_low();
+        enable_vtgt.set_low();
 
         // Output channel A on PWM0 to GPIO 0
-        let channel = &mut vtgt_pwm.channel_a;
-        channel.output_to(vtgt_pin);
-        channel.set_duty_cycle(1023).ok();
+        let mut config = pwm::Config::default();
+        config.top = 4095;
+        config.compare_a = 1023;
+        let vtgt_pwm = Pwm::new_output_a(slice, vtgt_pin, config.clone());
+
+        set_high_speed_pad(pin_number);
 
         Self {
             enable_5v_key,
+            _enable_5v: enable_5v,
             enable_vtgt,
             vtgt_pwm,
+            config,
         }
     }
 
@@ -457,7 +319,15 @@ impl TargetPower {
 
         let cnt = ((vomax - vomin - mv_diff) * limit_diff) / (vomax - vomin) + v33;
 
-        let channel = &mut self.vtgt_pwm.channel_a;
-        channel.set_duty_cycle(cnt as u16).unwrap();
+        self.config.compare_a = cnt as u16;
+        self.vtgt_pwm.set_config(&self.config);
     }
+}
+
+/// The PWM driver does not expose the pad settings, so set them like the other high speed IO.
+fn set_high_speed_pad(pin_number: usize) {
+    embassy_rp::pac::PADS_BANK0.gpio(pin_number).modify(|w| {
+        w.set_drive(embassy_rp::pac::pads::vals::Drive::_12M_A);
+        w.set_slewfast(true);
+    });
 }

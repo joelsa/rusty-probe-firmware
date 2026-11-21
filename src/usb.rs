@@ -1,140 +1,297 @@
-use dap_rs::usb::{dap_v1::CmsisDapV1, dap_v2::CmsisDapV2, winusb::MicrosoftDescriptors, Request};
-use dap_rs::usb_device::{class_prelude::*, prelude::*};
-use defmt::*;
-use rp2040_hal::usb::UsbBus;
-use usbd_serial::SerialPort;
+use crate::dap::{Response, DAP_PACKET_SIZE, REQUESTS, RESPONSES};
+use crate::setup::Irqs;
+use core::future::Future;
+use dap_rs::usb::Request;
+use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_rp::peripherals::USB;
+use embassy_rp::usb::Driver;
+use embassy_rp::Peri;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+use embassy_usb::class::cdc_acm::{self, CdcAcmClass};
+use embassy_usb::class::hid::{self, HidReaderWriter};
+use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
+use embassy_usb::types::StringIndex;
+use embassy_usb::{msos, Builder, Config, Handler, UsbDevice};
+use static_cell::StaticCell;
 
-/// Implements the CMSIS DAP descriptors.
+/// Signalled when the host resets, suspends or unconfigures the device, which ends the DAP session.
+static USB_INACTIVE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+pub type UsbDriver = Driver<'static, USB>;
+pub type DapV1 = HidReaderWriter<'static, UsbDriver, DAP_PACKET_SIZE, DAP_PACKET_SIZE>;
+
+pub const MAX_PACKET_SIZE: u16 = 64;
+
+const MANUFACTURER: &str = "Probe-rs development team";
+const PRODUCT: &str = "Rusty Probe with CMSIS-DAP v1/v2 Support";
+
+/// Vendor request code the host uses to fetch the Microsoft OS 2.0 descriptors.
+const MSOS_VENDOR_CODE: u8 = 0x41;
+
+/// CMSIS-DAP v2 interface GUID, from https://arm-software.github.io/CMSIS_5/DAP/html/group__DAP__ConfigUSB__gr.html
+const DAP_V2_INTERFACE_GUID: &str = "{CDB3B5AD-293B-4663-AA36-1AAE46463776}";
+
+const DAP_V1_REPORT_DESCRIPTOR: &[u8] = &[
+    0x06, 0x00, 0xFF, // Usage Page (Vendor Defined 0xFF00)
+    0x09, 0x01, // Usage (0x01)
+    0xA1, 0x01, // Collection (Application)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0xFF, //   Logical Maximum (255)
+    0x75, 0x08, //   Report Size (8)
+    0x95, 0x40, //   Report Count (64)
+    0x09, 0x01, //   Usage (0x01)
+    0x81, 0x02, //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+    0x95, 0x40, //   Report Count (64)
+    0x09, 0x01, //   Usage (0x01)
+    0x91,
+    0x02, //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
+    0x95, 0x01, //   Report Count (1)
+    0x09, 0x01, //   Usage (0x01)
+    0xB1,
+    0x02, //   Feature (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
+    0xC0, // End Collection
+];
+
+/// Implements the CMSIS DAP descriptors, the virtual COM port and the optional debug port.
 pub struct ProbeUsb {
-    device: UsbDevice<'static, UsbBus>,
-    device_state: UsbDeviceState,
-    winusb: MicrosoftDescriptors,
-    dap_v1: CmsisDapV1<'static, UsbBus>,
-    dap_v2: CmsisDapV2<'static, UsbBus>,
-    serial: SerialPort<'static, UsbBus>,
-
-    #[cfg(feature = "defmt-bbq")]
-    defmt_consumer: defmt_brtt::DefmtConsumer,
+    pub device: UsbDevice<'static, UsbDriver>,
+    pub dap_v1: DapV1,
+    pub dap_v2: CmsisDapV2,
+    pub vcom: CdcAcmClass<'static, UsbDriver>,
+    /// Carries the `defmt` logs and the reboot command, so they never mix with the target's UART.
+    #[cfg(any(feature = "defmt-bbq", feature = "usb-serial-reboot"))]
+    pub debug: CdcAcmClass<'static, UsbDriver>,
 }
 
-const MANUFACTURER: &'static str = "Probe-rs development team";
-const PRODUCT: &'static str = "Rusty Probe with CMSIS-DAP v1/v2 Support";
-
 impl ProbeUsb {
-    #[inline(always)]
-    pub fn new(
-        usb_bus: &'static UsbBusAllocator<UsbBus>,
-        #[cfg(feature = "defmt-bbq")] defmt_consumer: defmt_brtt::DefmtConsumer,
-    ) -> Self {
-        let winusb = MicrosoftDescriptors;
+    pub fn new(usb: Peri<'static, USB>, serial_number: &'static str) -> Self {
+        static CONFIG_DESCRIPTOR: StaticCell<[u8; 512]> = StaticCell::new();
+        static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        static MSOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        // Also holds the string descriptors, `PRODUCT` alone needs 82 bytes.
+        static CONTROL_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+        static DAP_V1_STATE: StaticCell<hid::State> = StaticCell::new();
+        static DAP_V2_HANDLER: StaticCell<DapV2Handler> = StaticCell::new();
+        static VCOM_STATE: StaticCell<cdc_acm::State> = StaticCell::new();
+        #[cfg(any(feature = "defmt-bbq", feature = "usb-serial-reboot"))]
+        static DEBUG_STATE: StaticCell<cdc_acm::State> = StaticCell::new();
 
-        let dap_v1 = CmsisDapV1::new(64, usb_bus);
-        let dap_v2 = CmsisDapV2::new(64, usb_bus);
-        let serial = SerialPort::new(&usb_bus);
+        let mut config = Config::new(0x1209, 0x4853);
+        config.manufacturer = Some(MANUFACTURER);
+        config.product = Some(PRODUCT);
+        config.serial_number = Some(serial_number);
+        config.max_power = 500;
+        config.max_packet_size_0 = 64;
 
-        let id = crate::device_signature::device_id_hex();
-        info!("Device ID: {}", id);
+        let mut builder = Builder::new(
+            Driver::new(usb, Irqs),
+            config,
+            CONFIG_DESCRIPTOR.init([0; 512]),
+            BOS_DESCRIPTOR.init([0; 256]),
+            MSOS_DESCRIPTOR.init([0; 256]),
+            CONTROL_BUF.init([0; 128]),
+        );
+        builder.msos_descriptor(msos::windows_version::WIN8_1, MSOS_VENDOR_CODE);
 
-        let descriptors_en = StringDescriptors::new(LangID::EN)
-            .manufacturer(MANUFACTURER)
-            .product(PRODUCT)
-            .serial_number(id);
+        // Added first, so it enumerates as the first serial port (`/dev/ttyACM0`), where `xtask`
+        // looks for it.
+        #[cfg(any(feature = "defmt-bbq", feature = "usb-serial-reboot"))]
+        let debug = CdcAcmClass::new(
+            &mut builder,
+            DEBUG_STATE.init(cdc_acm::State::new()),
+            MAX_PACKET_SIZE,
+        );
 
-        let descriptors_en_us = StringDescriptors::new(LangID::EN_US)
-            .manufacturer(MANUFACTURER)
-            .product(PRODUCT)
-            .serial_number(id);
+        let dap_v2 = CmsisDapV2::new(&mut builder, &DAP_V2_HANDLER);
 
-        let device = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x1209, 0x4853))
-            .strings(&[descriptors_en, descriptors_en_us])
-            .unwrap() // unwrap: Error is returned only if more than 16 languages are supplied.
-            .device_class(0)
-            .max_packet_size_0(64)
-            .unwrap() // unwrap: 64 is a valid packet size
-            .max_power(500)
-            .unwrap() // unwrap: 500 is a valid power value
-            .build();
+        let dap_v1 = HidReaderWriter::new(
+            &mut builder,
+            DAP_V1_STATE.init(hid::State::new()),
+            hid::Config {
+                report_descriptor: DAP_V1_REPORT_DESCRIPTOR,
+                request_handler: None,
+                poll_ms: 1,
+                max_packet_size: MAX_PACKET_SIZE,
+                hid_subclass: hid::HidSubclass::No,
+                hid_boot_protocol: hid::HidBootProtocol::None,
+            },
+        );
 
-        let device_state = device.state();
+        let vcom = CdcAcmClass::new(
+            &mut builder,
+            VCOM_STATE.init(cdc_acm::State::new()),
+            MAX_PACKET_SIZE,
+        );
 
         ProbeUsb {
-            device,
-            device_state,
-            winusb,
+            device: builder.build(),
             dap_v1,
             dap_v2,
-            serial,
-            #[cfg(feature = "defmt-bbq")]
-            defmt_consumer,
+            vcom,
+            #[cfg(any(feature = "defmt-bbq", feature = "usb-serial-reboot"))]
+            debug,
+        }
+    }
+}
+
+struct DapV2Handler {
+    interface: StringIndex,
+}
+
+impl Handler for DapV2Handler {
+    fn reset(&mut self) {
+        USB_INACTIVE.signal(());
+    }
+
+    fn configured(&mut self, configured: bool) {
+        if !configured {
+            USB_INACTIVE.signal(());
         }
     }
 
-    pub fn flush_logs(&mut self) {
-        #[cfg(feature = "defmt-bbq")]
+    fn suspended(&mut self, suspended: bool) {
+        if suspended {
+            USB_INACTIVE.signal(());
+        }
+    }
+
+    fn get_string(&mut self, index: StringIndex, _lang_id: u16) -> Option<&str> {
+        (index == self.interface).then_some("CMSIS-DAP v2 Interface")
+    }
+}
+
+/// CMSIS-DAP v2 bulk interface.
+///
+/// Unlike `embassy_usb::class::cmsis_dap_v2`, every packet is one command. Hosts send a command
+/// filling the whole packet without a trailing zero length packet, which that class would wait for.
+pub struct CmsisDapV2 {
+    read_ep: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointOut,
+    write_ep: <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn,
+}
+
+impl CmsisDapV2 {
+    fn new(
+        builder: &mut Builder<'static, UsbDriver>,
+        handler: &'static StaticCell<DapV2Handler>,
+    ) -> Self {
+        let interface_string = builder.string();
+        let mut function = builder.function(0xFF, 0, 0);
+        function.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
+        function.msos_feature(msos::RegistryPropertyFeatureDescriptor::new(
+            "DeviceInterfaceGUIDs",
+            msos::PropertyData::RegMultiSz(&[DAP_V2_INTERFACE_GUID]),
+        ));
+        let mut interface = function.interface();
+        let mut alt = interface.alt_setting(0xFF, 0, 0, Some(interface_string));
+        let read_ep = alt.endpoint_bulk_out(None, MAX_PACKET_SIZE);
+        let write_ep = alt.endpoint_bulk_in(None, MAX_PACKET_SIZE);
+        drop(function);
+
+        builder.handler(handler.init(DapV2Handler {
+            interface: interface_string,
+        }));
+
+        CmsisDapV2 { read_ep, write_ep }
+    }
+}
+
+#[embassy_executor::task]
+pub async fn run(mut device: UsbDevice<'static, UsbDriver>) -> ! {
+    device.run().await
+}
+
+/// Forwards DAP commands between the USB interfaces and the DAP engine on core 1.
+///
+/// Only the reads are raced, a command that was read is always processed, so requests and
+/// responses never get out of step.
+#[embassy_executor::task]
+pub async fn dap_bridge(mut dap_v1: DapV1, mut dap_v2: CmsisDapV2) -> ! {
+    let mut v1_report = [0; DAP_PACKET_SIZE];
+    let mut v2_packet = [0; DAP_PACKET_SIZE];
+
+    loop {
+        match select3(
+            USB_INACTIVE.wait(),
+            dap_v1.read(&mut v1_report),
+            dap_v2.read_ep.read(&mut v2_packet),
+        )
+        .await
         {
-            if self.device.state() == UsbDeviceState::Configured {
-                if let Ok(grant) = self.defmt_consumer.read() {
-                    let bytes_written = if let Ok(bytes_written) = self.serial.write(&grant) {
-                        bytes_written
-                    } else {
-                        0
-                    };
-                    grant.release(bytes_written);
+            Either3::First(()) => suspend().await,
+            Either3::Second(Ok(n)) => {
+                let response = process(Request::DAP1Command((v1_report, n))).await;
+                if response.len > 0 {
+                    // HID reports always have the full report size.
+                    reply(dap_v1.write(&response.data)).await;
                 }
             }
-        }
-    }
-
-    pub fn interrupt(&mut self) -> Option<Request> {
-        if self.device.poll(&mut [
-            &mut self.winusb,
-            &mut self.dap_v1,
-            &mut self.dap_v2,
-            &mut self.serial,
-        ]) {
-            let old_state = self.device_state;
-            let new_state = self.device.state();
-            self.device_state = new_state;
-
-            if (old_state != new_state) && (new_state != UsbDeviceState::Configured) {
-                return Some(Request::Suspend);
-            }
-
-            // Discard data from the serial interface
-            let mut buf = [0; 64 as usize];
-            let _read_data = self.serial.read(&mut buf);
-
-            #[cfg(feature = "usb-serial-reboot")]
-            if let Ok(read_data) = _read_data {
-                if &buf[..read_data] == &0xDABAD000u32.to_be_bytes() {
-                    rp2040_hal::rom_data::reset_to_usb_boot(0, 0);
+            Either3::Third(Ok(n)) => {
+                let response = process(Request::DAP2Command((v2_packet, n))).await;
+                if response.len > 0 {
+                    reply(dap_v2.write_ep.write(&response.data[..response.len])).await;
                 }
             }
+            Either3::Second(Err(_)) | Either3::Third(Err(_)) => {}
+        }
+    }
+}
 
-            let r = self.dap_v1.process();
-            if r.is_some() {
-                return r;
-            }
+async fn process(request: Request) -> Response {
+    REQUESTS.send(request).await;
+    RESPONSES.receive().await
+}
 
-            let r = self.dap_v2.process();
-            if r.is_some() {
-                return r;
+/// Sends a response, unless the host resets the device first. After a reset the response would
+/// wrongly answer the next command.
+async fn reply(write: impl Future<Output = Result<(), EndpointError>>) {
+    if let Either::First(()) = select(USB_INACTIVE.wait(), write).await {
+        suspend().await;
+    }
+}
+
+async fn suspend() {
+    defmt::info!("USB reset or suspended, suspending DAP");
+    REQUESTS.send(Request::Suspend).await;
+}
+
+/// Sends the `defmt` logs over the debug port.
+#[cfg(feature = "defmt-bbq")]
+#[embassy_executor::task]
+pub async fn log_pump(
+    mut sender: cdc_acm::Sender<'static, UsbDriver>,
+    mut consumer: defmt_brtt::DefmtConsumer,
+) -> ! {
+    loop {
+        sender.wait_connection().await;
+        while send_logs(&mut sender, &mut consumer).await.is_ok() {}
+    }
+}
+
+#[cfg(feature = "defmt-bbq")]
+async fn send_logs(
+    sender: &mut cdc_acm::Sender<'static, UsbDriver>,
+    consumer: &mut defmt_brtt::DefmtConsumer,
+) -> Result<(), EndpointError> {
+    let grant = consumer.wait_for_log().await;
+    // Short packets end every transfer, so no zero length packets are needed.
+    let len = grant.len().min(MAX_PACKET_SIZE as usize - 1);
+    sender.write_packet(&grant[..len]).await?;
+    grant.release(len);
+    Ok(())
+}
+
+/// Reboots into the USB bootloader when the magic sequence arrives on the debug port.
+#[cfg(feature = "usb-serial-reboot")]
+#[embassy_executor::task]
+pub async fn reboot_listener(mut receiver: cdc_acm::Receiver<'static, UsbDriver>) -> ! {
+    let mut buf = [0; MAX_PACKET_SIZE as usize];
+
+    loop {
+        receiver.wait_connection().await;
+        while let Ok(n) = receiver.read_packet(&mut buf).await {
+            if buf[..n] == 0xDABAD000u32.to_be_bytes() {
+                embassy_rp::rom_data::reset_to_usb_boot(0, 0);
             }
         }
-        None
-    }
-
-    /// Transmit a DAP report back over the DAPv1 HID interface
-    pub fn dap1_reply(&mut self, data: &[u8]) {
-        self.dap_v1
-            .write_packet(data)
-            .expect("DAPv1 EP write failed");
-    }
-
-    /// Transmit a DAP report back over the DAPv2 bulk interface
-    pub fn dap2_reply(&mut self, data: &[u8]) {
-        self.dap_v2
-            .write_packet(data)
-            .expect("DAPv2 EP write failed");
     }
 }

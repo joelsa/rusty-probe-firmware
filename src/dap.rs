@@ -1,13 +1,29 @@
 use crate::{
-    setup::{DirSwclkPin, DirSwdioPin, ResetPin, SwclkPin, SwdioPin},
+    leds::HostStatusToken,
+    setup::{DapResources, DirSwclkPin, DirSwdioPin, ResetPin, SwclkPin, SwdioPin},
     systick_delay::Delay,
 };
-use dap_rs::{swj::Dependencies, *};
+use dap_rs::{dap::DapVersion, swj::Dependencies, usb::Request, *};
 use defmt::trace;
-use embedded_hal::{
-    delay::DelayNs,
-    digital::{OutputPin, PinState},
-};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use embedded_hal::delay::DelayNs;
+use static_cell::StaticCell;
+
+/// Maximum size of a CMSIS-DAP v1 report and v2 packet.
+pub const DAP_PACKET_SIZE: usize = 64;
+
+/// A processed DAP command, ready to be sent back to the host.
+pub struct Response {
+    pub data: [u8; DAP_PACKET_SIZE],
+    pub len: usize,
+}
+
+/// DAP commands received over USB on core 0, processed on core 1.
+pub static REQUESTS: Channel<CriticalSectionRawMutex, Request, 1> = Channel::new();
+/// DAP responses produced on core 1, sent over USB on core 0.
+pub static RESPONSES: Channel<CriticalSectionRawMutex, Response, 1> = Channel::new();
+
+static DELAY: StaticCell<Delay> = StaticCell::new();
 
 pub struct Context {
     max_frequency: u32,
@@ -50,26 +66,38 @@ impl core::fmt::Debug for Context {
 impl Context {
     fn swdio_to_input(&mut self) {
         defmt::trace!("SWDIO -> input");
-        self.dir_swdio.set_low().ok();
-        self.swdio.into_input();
+        self.dir_swdio.set_low();
+        self.swdio.set_as_input();
     }
 
     fn swdio_to_output(&mut self) {
         defmt::trace!("SWDIO -> output");
-        self.swdio.into_output_in_state(PinState::High);
-        self.dir_swdio.set_high().ok();
+        self.swdio.set_high();
+        self.swdio.set_as_output();
+        self.dir_swdio.set_high();
     }
 
     fn swclk_to_input(&mut self) {
         defmt::trace!("SWCLK -> input");
-        self.dir_swclk.set_low().ok();
-        self.swclk.into_input();
+        self.dir_swclk.set_low();
+        self.swclk.set_as_input();
     }
 
     fn swclk_to_output(&mut self) {
         defmt::trace!("SWCLK -> output");
-        self.swclk.into_output_in_state(PinState::High);
-        self.dir_swclk.set_high().ok();
+        self.swclk.set_high();
+        self.swclk.set_as_output();
+        self.dir_swclk.set_high();
+    }
+
+    fn nreset_release(&mut self) {
+        // "open drain disconnect"
+        self.nreset.set_as_input();
+    }
+
+    fn nreset_assert(&mut self) {
+        self.nreset.set_low();
+        self.nreset.set_as_output();
     }
 
     fn from_pins(
@@ -81,8 +109,8 @@ impl Context {
         cpu_frequency: u32,
         delay: &'static Delay,
     ) -> Self {
-        dir_swdio.set_low().ok();
-        dir_swclk.set_low().ok();
+        dir_swdio.set_low();
+        dir_swclk.set_low();
         defmt::trace!("SWCLK -> input");
         defmt::trace!("SWDIO -> input");
 
@@ -125,10 +153,9 @@ impl swj::Dependencies<Swd, Jtag> for Context {
 
         if mask.contains(swj::Pins::NRESET) {
             if output.contains(swj::Pins::NRESET) {
-                // "open drain disconnect"
-                self.nreset.into_input();
+                self.nreset_release();
             } else {
-                self.nreset.into_output_in_state(PinState::Low);
+                self.nreset_assert();
             }
         }
 
@@ -161,7 +188,7 @@ impl swj::Dependencies<Swd, Jtag> for Context {
         ret.set(swj::Pins::SWCLK, self.swclk.is_high());
         self.swdio_to_input();
         ret.set(swj::Pins::SWDIO, self.swdio.is_high());
-        self.nreset.into_input();
+        self.nreset_release();
         ret.set(swj::Pins::NRESET, self.nreset.is_high());
 
         trace!(
@@ -219,7 +246,7 @@ impl swj::Dependencies<Swd, Jtag> for Context {
     fn high_impedance_mode(&mut self) {
         self.swdio_to_input();
         self.swclk_to_input();
-        self.nreset.into_input();
+        self.nreset_release();
     }
 }
 
@@ -263,7 +290,7 @@ impl From<Context> for Swd {
         // Maybe this should go to some `Swd::new`
         value.swdio_to_output();
         value.swclk_to_output();
-        value.nreset.into_input();
+        value.nreset_release();
 
         Self(value)
     }
@@ -561,7 +588,7 @@ pub fn create_dap(
     dir_swclk: DirSwclkPin,
     cpu_frequency: u32,
     delay: &'static Delay,
-    leds: crate::leds::HostStatusToken,
+    leds: HostStatusToken,
 ) -> crate::setup::DapHandler {
     let context = Context::from_pins(
         swdio,
@@ -578,4 +605,54 @@ pub fn create_dap(
     defmt::info!("Making dap interface with context: {}", context);
 
     dap::Dap::new(context, leds, wait, swo, version_string)
+}
+
+/// Processes the DAP commands forwarded by the USB side. Runs on core 1, so that long running
+/// commands never block USB or the virtual COM port on core 0.
+#[embassy_executor::task]
+pub async fn engine(resources: DapResources) -> ! {
+    let DapResources {
+        swdio,
+        swclk,
+        nreset,
+        dir_swdio,
+        dir_swclk,
+        systick,
+        host_status,
+    } = resources;
+
+    let cpu_frequency = embassy_rp::clocks::clk_sys_freq();
+    // The SysTick is core local, so it has to be set up on the core doing the bit-banging.
+    let delay = DELAY.init(Delay::new(systick, cpu_frequency));
+
+    let mut dap = create_dap(
+        git_version::git_version!(),
+        swdio,
+        swclk,
+        nreset,
+        dir_swdio,
+        dir_swclk,
+        cpu_frequency,
+        delay,
+        host_status,
+    );
+
+    loop {
+        let (report, n, version) = match REQUESTS.receive().await {
+            Request::DAP1Command((report, n)) => (report, n, DapVersion::V1),
+            Request::DAP2Command((report, n)) => (report, n, DapVersion::V2),
+            Request::Suspend => {
+                defmt::info!("Got USB suspend command");
+                dap.suspend();
+                continue;
+            }
+        };
+
+        let mut response = Response {
+            data: [0; DAP_PACKET_SIZE],
+            len: 0,
+        };
+        response.len = dap.process_command(&report[..n], &mut response.data, version);
+        RESPONSES.send(response).await;
+    }
 }

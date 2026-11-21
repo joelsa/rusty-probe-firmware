@@ -1,110 +1,36 @@
-use cortex_m::interrupt;
-use rp2040_hal::pac;
-use rp2040_hal::rom_data;
+use embassy_rp::flash::{Blocking, Flash};
+use embassy_rp::peripherals::FLASH;
+use embassy_rp::Peri;
 use static_cell::StaticCell;
 
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
 const DEVICE_ID_LEN: usize = 22;
 static DEVICE_ID_STR: StaticCell<[u8; DEVICE_ID_LEN]> = StaticCell::new();
 
-pub fn device_id_hex() -> &'static str {
+/// Returns the flash unique ID followed by the flash JEDEC ID as a lower case hex string.
+pub fn device_id_hex(flash: Peri<'static, FLASH>) -> &'static str {
+    let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(flash);
+
+    let mut uid = [0; 8];
+    if let Err(e) = flash.blocking_unique_id(&mut uid) {
+        defmt::warn!("Reading the flash unique ID failed: {}", e);
+    }
+
+    let jedec = match flash.blocking_jedec_id() {
+        Ok(jedec) => jedec.to_be_bytes(),
+        Err(e) => {
+            defmt::warn!("Reading the flash JEDEC ID failed: {}", e);
+            [0; 4]
+        }
+    };
+
     let mut device_id_str = [0; DEVICE_ID_LEN];
-
-    unsafe {
-        interrupt::free(|_| {
-            let hex = b"0123456789abcdef";
-            for (i, b) in read_uid().iter().chain(read_jedec().iter()).enumerate() {
-                let lo = b & 0xf;
-                let hi = (b >> 4) & 0xf;
-                device_id_str[i * 2] = hex[hi as usize];
-                device_id_str[i * 2 + 1] = hex[lo as usize];
-            }
-        });
-
-        let id = DEVICE_ID_STR.init(device_id_str);
-        core::str::from_utf8_unchecked(id)
-    }
-}
-
-#[inline(always)]
-#[link_section = ".data.ram_func"]
-unsafe fn set_cs(level: bool) {
-    (&*pac::IO_QSPI::ptr())
-        .gpio_qspiss()
-        .gpio_ctrl()
-        .modify(|_, w| {
-            if level {
-                w.outover().high()
-            } else {
-                w.outover().low()
-            }
-        });
-}
-
-#[link_section = ".data.ram_func"]
-#[inline(never)]
-unsafe fn do_flash_cmd(txrxbuf: &mut [u8]) {
-    // Load important addresses to the stack
-    let connect_internal_flash = rom_data::connect_internal_flash;
-    let flash_exit_xip = rom_data::flash_exit_xip;
-    let flash_flush_cache = rom_data::flash_flush_cache;
-
-    let mut boot2: core::mem::MaybeUninit<[u8; 256]> = core::mem::MaybeUninit::uninit();
-
-    let xip_base = 0x10000000 as *const u32;
-    rom_data::memcpy(boot2.as_mut_ptr() as _, xip_base as _, 256);
-
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-    connect_internal_flash();
-    flash_exit_xip();
-
-    set_cs(false);
-
-    let ssi = &*pac::XIP_SSI::ptr();
-
-    for b in txrxbuf {
-        while !ssi.sr().read().tfnf().bit_is_set() {}
-        ssi.dr0().write(|w| w.dr().bits(*b as _));
-
-        while !ssi.sr().read().rfne().bit_is_set() {}
-        *b = ssi.dr0().read().dr().bits() as _;
+    let hex = b"0123456789abcdef";
+    for (i, b) in uid.iter().chain(jedec[1..].iter()).enumerate() {
+        device_id_str[i * 2] = hex[(b >> 4) as usize];
+        device_id_str[i * 2 + 1] = hex[(b & 0xf) as usize];
     }
 
-    set_cs(true);
-
-    flash_flush_cache();
-
-    let ptr = (boot2.as_mut_ptr() as *const u8).add(1) as *const ();
-    let start: extern "C" fn() = core::mem::transmute(ptr);
-    start();
-}
-
-fn read_uid() -> [u8; 8] {
-    const FLASH_RUID_CMD: u8 = 0x4b;
-    const FLASH_RUID_DUMMY_BYTES: usize = 4;
-    const FLASH_RUID_DATA_BYTES: usize = 8;
-    const FLASH_RUID_TOTAL_BYTES: usize = 1 + FLASH_RUID_DUMMY_BYTES + FLASH_RUID_DATA_BYTES;
-
-    let mut buf = [0; FLASH_RUID_TOTAL_BYTES];
-    buf[0] = FLASH_RUID_CMD;
-
-    unsafe {
-        do_flash_cmd(&mut buf);
-    }
-
-    buf[FLASH_RUID_DUMMY_BYTES + 1..].try_into().unwrap()
-}
-
-fn read_jedec() -> [u8; 3] {
-    const FLASH_JEDEC_CMD: u8 = 0x9f;
-    const FLASH_JEDEC_TOTAL_BYTES: usize = 4;
-
-    let mut buf = [0; FLASH_JEDEC_TOTAL_BYTES];
-    buf[0] = FLASH_JEDEC_CMD;
-
-    unsafe {
-        do_flash_cmd(&mut buf);
-    }
-
-    buf[1..].try_into().unwrap()
+    let id = DEVICE_ID_STR.init(device_id_str);
+    core::str::from_utf8(id).unwrap_or_default()
 }
